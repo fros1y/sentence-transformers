@@ -429,9 +429,7 @@ class SentenceTransformer(nn.Sequential):
                     data = next(data_iterator)
 
                 features, labels = batch_to_device(data, self.device)
-                loss_value = (
-                    loss_model(features, labels) / optimizer_params["accum_grad"]
-                )
+                loss_value = loss_model(features, labels) / accum_grad
 
                 if fp16:
                     with amp.scale_loss(loss_value, optimizer) as scaled_loss:
@@ -449,7 +447,7 @@ class SentenceTransformer(nn.Sequential):
 
                 scheduler.step()
 
-                if training_steps % optimizer_params["accum_grad"] == 0:
+                if training_steps % accum_grad == 0:
                     optimizer.step()
                     optimizer.zero_grad()
 
