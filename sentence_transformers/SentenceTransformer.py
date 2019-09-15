@@ -3,59 +3,91 @@ import logging
 import os
 import shutil
 from collections import OrderedDict
-from typing import List, Dict, Tuple, Iterable, Type
+from typing import Dict, Iterable, List, Tuple, Type
 from zipfile import ZipFile
 
 import numpy as np
 import pytorch_transformers
 import torch
 from numpy import ndarray
-from torch import nn, Tensor
+from torch import Tensor, nn
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
 
-from . import __DOWNLOAD_SERVER__
+from . import __DOWNLOAD_SERVER__, __version__
 from .evaluation import SentenceEvaluator
-from .util import import_from_string, batch_to_device, http_get
-from . import __version__
+from .util import batch_to_device, http_get, import_from_string
+
 
 class SentenceTransformer(nn.Sequential):
-    def __init__(self, model_name_or_path: str = None, modules: Iterable[nn.Module] = None, device: str = None):
+    def __init__(
+        self,
+        model_name_or_path: str = None,
+        modules: Iterable[nn.Module] = None,
+        device: str = None,
+    ):
         if modules is not None and not isinstance(modules, OrderedDict):
-            modules = OrderedDict([(str(idx), module) for idx, module in enumerate(modules)])
+            modules = OrderedDict(
+                [(str(idx), module) for idx, module in enumerate(modules)]
+            )
 
         if model_name_or_path is not None and model_name_or_path != "":
-            logging.info("Load pretrained SentenceTransformer: {}".format(model_name_or_path))
+            logging.info(
+                "Load pretrained SentenceTransformer: {}".format(model_name_or_path)
+            )
 
-            if '/' not in model_name_or_path and '\\' not in model_name_or_path and not os.path.isdir(model_name_or_path):
-                logging.info("Did not find a / or \\ in the name. Assume to download model from server")
-                model_name_or_path = __DOWNLOAD_SERVER__ + model_name_or_path + '.zip'
+            if (
+                "/" not in model_name_or_path
+                and "\\" not in model_name_or_path
+                and not os.path.isdir(model_name_or_path)
+            ):
+                logging.info(
+                    "Did not find a / or \\ in the name. Assume to download model from server"
+                )
+                model_name_or_path = __DOWNLOAD_SERVER__ + model_name_or_path + ".zip"
 
-            if model_name_or_path.startswith('http://') or model_name_or_path.startswith('https://'):
+            if model_name_or_path.startswith(
+                "http://"
+            ) or model_name_or_path.startswith("https://"):
                 model_url = model_name_or_path
-                folder_name = model_url.replace("https://", "").replace("http://", "").replace("/", "_")[:250]
+                folder_name = (
+                    model_url.replace("https://", "")
+                    .replace("http://", "")
+                    .replace("/", "_")[:250]
+                )
 
                 try:
                     from torch.hub import _get_torch_home
+
                     torch_cache_home = _get_torch_home()
                 except ImportError:
                     torch_cache_home = os.path.expanduser(
-                        os.getenv('TORCH_HOME', os.path.join(
-                            os.getenv('XDG_CACHE_HOME', '~/.cache'), 'torch')))
-                default_cache_path = os.path.join(torch_cache_home, 'sentence_transformers')
+                        os.getenv(
+                            "TORCH_HOME",
+                            os.path.join(
+                                os.getenv("XDG_CACHE_HOME", "~/.cache"), "torch"
+                            ),
+                        )
+                    )
+                default_cache_path = os.path.join(
+                    torch_cache_home, "sentence_transformers"
+                )
                 model_path = os.path.join(default_cache_path, folder_name)
                 os.makedirs(model_path, exist_ok=True)
-
 
                 if not os.listdir(model_path):
                     if model_url[-1] is "/":
                         model_url = model_url[:-1]
-                    logging.info("Downloading sentence transformer model from {} and saving it at {}".format(model_url, model_path))
+                    logging.info(
+                        "Downloading sentence transformer model from {} and saving it at {}".format(
+                            model_url, model_path
+                        )
+                    )
                     try:
-                        zip_save_path = os.path.join(model_path, 'model.zip')
+                        zip_save_path = os.path.join(model_path, "model.zip")
                         http_get(model_url, zip_save_path)
-                        with ZipFile(zip_save_path, 'r') as zip:
+                        with ZipFile(zip_save_path, "r") as zip:
                             zip.extractall(model_path)
                     except Exception as e:
                         shutil.rmtree(model_path)
@@ -65,16 +97,19 @@ class SentenceTransformer(nn.Sequential):
 
             #### Load from disk
             if model_path is not None:
-                logging.info("Load SentenceTransformer from folder: {}".format(model_path))
-                with open(os.path.join(model_path, 'modules.json')) as fIn:
+                logging.info(
+                    "Load SentenceTransformer from folder: {}".format(model_path)
+                )
+                with open(os.path.join(model_path, "modules.json")) as fIn:
                     contained_modules = json.load(fIn)
 
                 modules = OrderedDict()
                 for module_config in contained_modules:
-                    module_class = import_from_string(module_config['type'])
-                    module = module_class.load(os.path.join(model_path, module_config['path']))
-                    modules[module_config['name']] = module
-
+                    module_class = import_from_string(module_config["type"])
+                    module = module_class.load(
+                        os.path.join(model_path, module_config["path"])
+                    )
+                    modules[module_config["name"]] = module
 
         super().__init__(modules)
         if device is None:
@@ -83,7 +118,13 @@ class SentenceTransformer(nn.Sequential):
         self.device = torch.device(device)
         self.to(device)
 
-    def encode(self, sentences: List[str], batch_size: int = 8, show_progress_bar: bool = None, progress_callback_fn = None) -> List[ndarray]:
+    def encode(
+        self,
+        sentences: List[str],
+        batch_size: int = 8,
+        show_progress_bar: bool = None,
+        progress_callback_fn=None,
+    ) -> List[ndarray]:
         """
        Computes sentence embeddings
 
@@ -97,7 +138,10 @@ class SentenceTransformer(nn.Sequential):
            a list with ndarrays of the embeddings for each sentence
        """
         if show_progress_bar is None:
-            show_progress_bar = (logging.getLogger().getEffectiveLevel()==logging.INFO or logging.getLogger().getEffectiveLevel()==logging.DEBUG)
+            show_progress_bar = (
+                logging.getLogger().getEffectiveLevel() == logging.INFO
+                or logging.getLogger().getEffectiveLevel() == logging.DEBUG
+            )
 
         all_embeddings = []
         length_sorted_idx = np.argsort([len(sen) for sen in sentences])
@@ -117,7 +161,7 @@ class SentenceTransformer(nn.Sequential):
 
             longest_seq = 0
 
-            for idx in length_sorted_idx[batch_start: batch_end]:
+            for idx in length_sorted_idx[batch_start:batch_end]:
                 sentence = sentences[idx]
                 tokens = self.tokenize(sentence)
                 longest_seq = max(longest_seq, len(tokens))
@@ -133,11 +177,13 @@ class SentenceTransformer(nn.Sequential):
                     features[feature_name].append(sentence_features[feature_name])
 
             for feature_name in features:
-                features[feature_name] = torch.tensor(np.asarray(features[feature_name])).to(self.device)
+                features[feature_name] = torch.tensor(
+                    np.asarray(features[feature_name])
+                ).to(self.device)
 
             with torch.no_grad():
                 embeddings = self.forward(features)
-                embeddings = embeddings['sentence_embedding'].to('cpu').numpy()
+                embeddings = embeddings["sentence_embedding"].to("cpu").numpy()
                 all_embeddings.extend(embeddings)
 
         reverting_order = np.argsort(length_sorted_idx)
@@ -171,16 +217,23 @@ class SentenceTransformer(nn.Sequential):
 
         for idx, name in enumerate(self._modules):
             module = self._modules[name]
-            model_path = os.path.join(path, str(idx)+"_"+type(module).__name__)
+            model_path = os.path.join(path, str(idx) + "_" + type(module).__name__)
             os.makedirs(model_path, exist_ok=True)
             module.save(model_path)
-            contained_modules.append({'idx': idx, 'name': name, 'path': os.path.basename(model_path), 'type': type(module).__module__})
+            contained_modules.append(
+                {
+                    "idx": idx,
+                    "name": name,
+                    "path": os.path.basename(model_path),
+                    "type": type(module).__module__,
+                }
+            )
 
-        with open(os.path.join(path, 'modules.json'), 'w') as fOut:
+        with open(os.path.join(path, "modules.json"), "w") as fOut:
             json.dump(contained_modules, fOut, indent=2)
 
-        with open(os.path.join(path, 'config.json'), 'w') as fOut:
-            json.dump({'__version__': __version__}, fOut, indent=2)
+        with open(os.path.join(path, "config.json"), "w") as fOut:
+            json.dump({"__version__": __version__}, fOut, indent=2)
 
     def smart_batching_collate(self, batch):
         """
@@ -215,31 +268,37 @@ class SentenceTransformer(nn.Sequential):
                     feature_lists[feature_name].append(sentence_features[feature_name])
 
             for feature_name in feature_lists:
-                feature_lists[feature_name] = torch.tensor(np.asarray(feature_lists[feature_name]))
+                feature_lists[feature_name] = torch.tensor(
+                    np.asarray(feature_lists[feature_name])
+                )
 
             features.append(feature_lists)
 
-        return {'features': features, 'labels': torch.stack(labels)}
+        return {"features": features, "labels": torch.stack(labels)}
 
-
-
-    def fit(self,
-            train_objectives: Iterable[Tuple[DataLoader, nn.Module]],
-            evaluator: SentenceEvaluator,
-            epochs: int = 1,
-            scheduler: str = 'WarmupLinear',
-            warmup_steps: int = 10000,
-            optimizer_class: Type[Optimizer] = pytorch_transformers.AdamW,
-            optimizer_params : Dict[str, object ]= {'lr': 2e-5, 'eps': 1e-6, 'correct_bias': False},
-            weight_decay: float = 0.01,
-            evaluation_steps: int = 0,
-            output_path: str = None,
-            save_best_model: bool = True,
-            max_grad_norm: float = 1,
-            fp16: bool = False,
-            fp16_opt_level: str = '01',
-            local_rank: int = -1
-            ):
+    def fit(
+        self,
+        train_objectives: Iterable[Tuple[DataLoader, nn.Module]],
+        evaluator: SentenceEvaluator,
+        epochs: int = 1,
+        scheduler: str = "WarmupLinear",
+        warmup_steps: int = 10000,
+        optimizer_class: Type[Optimizer] = pytorch_transformers.AdamW,
+        optimizer_params: Dict[str, object] = {
+            "lr": 2e-5,
+            "eps": 1e-6,
+            "correct_bias": False,
+            "accum_grad": 1,
+        },
+        weight_decay: float = 0.01,
+        evaluation_steps: int = 0,
+        output_path: str = None,
+        save_best_model: bool = True,
+        max_grad_norm: float = 1,
+        fp16: bool = False,
+        fp16_opt_level: str = "01",
+        local_rank: int = -1,
+    ):
         """
         Train the model with the given training objective
 
@@ -266,8 +325,11 @@ class SentenceTransformer(nn.Sequential):
         if output_path is not None:
             os.makedirs(output_path, exist_ok=True)
             if os.listdir(output_path):
-                raise ValueError("Output directory ({}) already exists and is not empty.".format(
-                    output_path))
+                raise ValueError(
+                    "Output directory ({}) already exists and is not empty.".format(
+                        output_path
+                    )
+                )
 
         dataloaders = [dataloader for dataloader, _ in train_objectives]
 
@@ -290,17 +352,36 @@ class SentenceTransformer(nn.Sequential):
         schedulers = []
         for loss_model in loss_models:
             param_optimizer = list(loss_model.named_parameters())
-            no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+            no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
             optimizer_grouped_parameters = [
-                {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': weight_decay},
-                {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+                {
+                    "params": [
+                        p
+                        for n, p in param_optimizer
+                        if not any(nd in n for nd in no_decay)
+                    ],
+                    "weight_decay": weight_decay,
+                },
+                {
+                    "params": [
+                        p for n, p in param_optimizer if any(nd in n for nd in no_decay)
+                    ],
+                    "weight_decay": 0.0,
+                },
             ]
             t_total = num_train_steps
             if local_rank != -1:
                 t_total = t_total // torch.distributed.get_world_size()
 
-            optimizer = optimizer_class(optimizer_grouped_parameters, **optimizer_params)
-            scheduler = self._get_scheduler(optimizer, scheduler=scheduler, warmup_steps=warmup_steps, t_total=t_total)
+            optimizer = optimizer_class(
+                optimizer_grouped_parameters, **optimizer_params
+            )
+            scheduler = self._get_scheduler(
+                optimizer,
+                scheduler=scheduler,
+                warmup_steps=warmup_steps,
+                t_total=t_total,
+            )
 
             optimizers.append(optimizer)
             schedulers.append(scheduler)
@@ -309,10 +390,14 @@ class SentenceTransformer(nn.Sequential):
             try:
                 from apex import amp
             except ImportError:
-                raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+                raise ImportError(
+                    "Please install apex from https://www.github.com/nvidia/apex to use fp16 training."
+                )
 
             for idx in range(len(loss_models)):
-                model, optimizer = amp.initialize(loss_models[idx], optimizers[idx], opt_level=fp16_opt_level)
+                model, optimizer = amp.initialize(
+                    loss_models[idx], optimizers[idx], opt_level=fp16_opt_level
+                )
                 loss_models[idx] = model
                 optimizers[idx] = optimizer
 
@@ -344,30 +429,43 @@ class SentenceTransformer(nn.Sequential):
                     data = next(data_iterator)
 
                 features, labels = batch_to_device(data, self.device)
-                loss_value = loss_model(features, labels)
+                loss_value = (
+                    loss_model(features, labels) / optimizer_params["accum_grad"]
+                )
 
                 if fp16:
                     with amp.scale_loss(loss_value, optimizer) as scaled_loss:
                         scaled_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(
+                        amp.master_params(optimizer), max_grad_norm
+                    )
                 else:
                     loss_value.backward()
-                    torch.nn.utils.clip_grad_norm_(loss_model.parameters(), max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(
+                        loss_model.parameters(), max_grad_norm
+                    )
 
                 training_steps += 1
 
-                optimizer.step()
                 scheduler.step()
-                optimizer.zero_grad()
+
+                if training_steps % optimizer_params["accum_grad"] == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
+
                 global_step += 1
 
                 if evaluation_steps > 0 and training_steps % evaluation_steps == 0:
-                    self._eval_during_training(evaluator, output_path, save_best_model, epoch, training_steps)
+                    self._eval_during_training(
+                        evaluator, output_path, save_best_model, epoch, training_steps
+                    )
                     for loss_model in loss_models:
                         loss_model.zero_grad()
                         loss_model.train()
 
-            self._eval_during_training(evaluator, output_path, save_best_model, epoch, -1)
+            self._eval_during_training(
+                evaluator, output_path, save_best_model, epoch, -1
+            )
 
     def evaluate(self, evaluator: SentenceEvaluator, output_path: str = None):
         """
@@ -382,7 +480,9 @@ class SentenceTransformer(nn.Sequential):
             os.makedirs(output_path, exist_ok=True)
         return evaluator(self, output_path)
 
-    def _eval_during_training(self, evaluator, output_path, save_best_model, epoch, steps):
+    def _eval_during_training(
+        self, evaluator, output_path, save_best_model, epoch, steps
+    ):
         """Runs evaluation during the training"""
         if evaluator is not None:
             score = evaluator(self, output_path=output_path, epoch=epoch, steps=steps)
@@ -390,21 +490,30 @@ class SentenceTransformer(nn.Sequential):
                 self.save(output_path)
                 self.best_score = score
 
-
-    def _get_scheduler(self, optimizer, scheduler: str, warmup_steps: int, t_total: int):
+    def _get_scheduler(
+        self, optimizer, scheduler: str, warmup_steps: int, t_total: int
+    ):
         """
         Returns the correct learning rate scheduler
         """
         scheduler = scheduler.lower()
-        if scheduler == 'constantlr':
+        if scheduler == "constantlr":
             return pytorch_transformers.ConstantLRSchedule(optimizer)
-        elif scheduler == 'warmupconstant':
-            return pytorch_transformers.WarmupConstantSchedule(optimizer, warmup_steps=warmup_steps)
-        elif scheduler == 'warmuplinear':
-            return pytorch_transformers.WarmupLinearSchedule(optimizer, warmup_steps=warmup_steps, t_total=t_total)
-        elif scheduler == 'warmupcosine':
-            return pytorch_transformers.WarmupCosineSchedule(optimizer, warmup_steps=warmup_steps, t_total=t_total)
-        elif scheduler == 'warmupcosinewithhardrestarts':
-            return pytorch_transformers.WarmupCosineWithHardRestartsSchedule(optimizer, warmup_steps=warmup_steps, t_total=t_total)
+        elif scheduler == "warmupconstant":
+            return pytorch_transformers.WarmupConstantSchedule(
+                optimizer, warmup_steps=warmup_steps
+            )
+        elif scheduler == "warmuplinear":
+            return pytorch_transformers.WarmupLinearSchedule(
+                optimizer, warmup_steps=warmup_steps, t_total=t_total
+            )
+        elif scheduler == "warmupcosine":
+            return pytorch_transformers.WarmupCosineSchedule(
+                optimizer, warmup_steps=warmup_steps, t_total=t_total
+            )
+        elif scheduler == "warmupcosinewithhardrestarts":
+            return pytorch_transformers.WarmupCosineWithHardRestartsSchedule(
+                optimizer, warmup_steps=warmup_steps, t_total=t_total
+            )
         else:
             raise ValueError("Unknown scheduler {}".format(scheduler))
