@@ -283,12 +283,12 @@ class SentenceTransformer(nn.Sequential):
         epochs: int = 1,
         scheduler: str = "WarmupLinear",
         warmup_steps: int = 10000,
+        accum_grad: int = 1,
         optimizer_class: Type[Optimizer] = pytorch_transformers.AdamW,
         optimizer_params: Dict[str, object] = {
             "lr": 2e-5,
             "eps": 1e-6,
             "correct_bias": False,
-            "accum_grad": 1,
         },
         weight_decay: float = 0.01,
         evaluation_steps: int = 0,
