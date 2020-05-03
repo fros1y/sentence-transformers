@@ -1,10 +1,7 @@
-__version__ = "0.1.1"
-from .config import SentenceTransformerConfig, LossFunction, TripletMetric
-from .trainer import TrainConfig
-from .input_example import InputExample
-from .evaluation import SentenceEvaluator, EmbeddingSimilarity, EmbeddingSimilarityEvaluator, \
-    LabelAccuracyEvaluator, TripletEvaluator, SequentialEvaluator, BinaryEmbeddingSimilarityEvaluator
-from .datasets import SentencesDataset, SentenceLabelDataset
+__version__ = "0.2.6"
+__DOWNLOAD_SERVER__ = 'https://public.ukp.informatik.tu-darmstadt.de/reimers/sentence-transformers/v0.2/'
+from .datasets import SentencesDataset, SentenceLabelDataset, ParallelSentencesDataset
 from .data_samplers import LabelSampler
-from .SentenceTransformer import SentenceTransformer
 from .LoggingHandler import LoggingHandler
+from .SentenceTransformer import SentenceTransformer
+

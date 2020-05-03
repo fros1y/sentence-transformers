@@ -1,45 +1,36 @@
-import os
-from pytorch_transformers import WEIGHTS_NAME, CONFIG_NAME, PretrainedConfig, BertConfig, XLNetConfig
-import torch
-from torch import Tensor
-from numpy import ndarray
-from typing import List, Tuple, Callable
-from torch.utils.data import DataLoader
+import json
 import logging
-import importlib
-import sys
+import os
 import shutil
+from collections import OrderedDict
+from typing import List, Dict, Tuple, Iterable, Type
+from zipfile import ZipFile
 
-from .util import http_get
-from .config import SentenceTransformerConfig, LossFunction
+import numpy as np
+import transformers
+import torch
+from numpy import ndarray
+from torch import nn, Tensor
+from torch.optim import Optimizer
+from torch.utils.data import DataLoader
+from tqdm import tqdm, trange
+
+from . import __DOWNLOAD_SERVER__
 from .evaluation import SentenceEvaluator
-from .encoder import SentenceEncoder
-from .trainer import SentenceTrainer, TrainConfig
+from .util import import_from_string, batch_to_device, http_get
+from . import __version__
 
+class SentenceTransformer(nn.Sequential):
+    def __init__(self, model_name_or_path: str = None, modules: Iterable[nn.Module] = None, device: str = None):
+        if modules is not None and not isinstance(modules, OrderedDict):
+            modules = OrderedDict([(str(idx), module) for idx, module in enumerate(modules)])
 
-class SentenceTransformer:
-    """
-    Wrapper around a Sentence BERT model for easy use.
-    """
-    def __init__(self, model_name_or_path: str = None, sentence_transformer_config: SentenceTransformerConfig = None):
-        """
-        Creates a Sentence BERT model based on either a pretrained model downloaded from the internet or the file system
-        or based on a config for a new model
+        if model_name_or_path is not None and model_name_or_path != "":
+            logging.info("Load pretrained SentenceTransformer: {}".format(model_name_or_path))
 
-        When a model_url is given, then the files are downloaded from the URL. They are stored at model_path or in a
-        temp folder based on the URL, when no model_path is given.
-        When no model_url is given, but a model_path, then the model is loaded from the file system.
-        When neither url nor path is given, then a new model is created based on the sbert_config
-
-        :param model_name_or_path:
-            A pre-trained model name, a URL or a path on the file system
-        :param sentence_transformer_config:
-            configuration for a new model
-        """
-        model_path = None
-        if model_name_or_path is not None:
-            if '/' not in model_name_or_path and '\\' not in model_name_or_path:
-                model_name_or_path = 'https://public.ukp.informatik.tu-darmstadt.de/reimers/sentence-transformers/v0.1/' + model_name_or_path
+            if '/' not in model_name_or_path and '\\' not in model_name_or_path and not os.path.isdir(model_name_or_path):
+                logging.info("Did not find a '/' or '\\' in the name. Assume to download model from server.")
+                model_name_or_path = __DOWNLOAD_SERVER__ + model_name_or_path + '.zip'
 
             if model_name_or_path.startswith('http://') or model_name_or_path.startswith('https://'):
                 model_url = model_name_or_path
@@ -61,141 +52,399 @@ class SentenceTransformer:
                         model_url = model_url[:-1]
                     logging.info("Downloading sentence transformer model from {} and saving it at {}".format(model_url, model_path))
                     try:
-                        http_get(model_url + "/" + WEIGHTS_NAME, os.path.join(model_path, WEIGHTS_NAME))
-                        http_get(model_url + "/" + CONFIG_NAME, os.path.join(model_path, CONFIG_NAME))
-                        http_get(model_url + "/" + 'sentence_transformer_config.json', os.path.join(model_path, 'sentence_transformer_config.json'))
+                        zip_save_path = os.path.join(model_path, 'model.zip')
+                        http_get(model_url, zip_save_path)
+                        with ZipFile(zip_save_path, 'r') as zip:
+                            zip.extractall(model_path)
                     except Exception as e:
                         shutil.rmtree(model_path)
                         raise e
             else:
                 model_path = model_name_or_path
 
+            #### Load from disk
+            if model_path is not None:
+                logging.info("Load SentenceTransformer from folder: {}".format(model_path))
 
-        if model_path is not None:
-            logging.info("Loading model from {}".format(model_path))
-            output_model_file = os.path.join(model_path, WEIGHTS_NAME)
-            output_transformer_config_file = os.path.join(model_path, CONFIG_NAME)
-            output_sentence_transformer_config_file = os.path.join(model_path, 'sentence_transformer_config.json')
+                if os.path.exists(os.path.join(model_path, 'config.json')):
+                    with open(os.path.join(model_path, 'config.json')) as fIn:
+                        config = json.load(fIn)
+                        if config['__version__'] > __version__:
+                            logging.warning("You try to use a model that was created with version {}, however, your version is {}. This might cause unexpected behavior or errors. In that case, try to update to the latest version.\n\n\n".format(config['__version__'], __version__))
 
-            if not os.path.exists(output_model_file) or not os.path.exists(output_transformer_config_file) or not os.path.exists(output_sentence_transformer_config_file):
-                raise Exception("It appears that files are missing in {}. The sentence transformer model cannot be loaded".format(model_path))
+                with open(os.path.join(model_path, 'modules.json')) as fIn:
+                    contained_modules = json.load(fIn)
+
+                modules = OrderedDict()
+                for module_config in contained_modules:
+                    module_class = import_from_string(module_config['type'])
+                    module = module_class.load(os.path.join(model_path, module_config['path']))
+                    modules[module_config['name']] = module
 
 
-            sentence_transformer_config = SentenceTransformerConfig.from_json_file(output_sentence_transformer_config_file)
-            logging.info("Transformer Model config {}".format(sentence_transformer_config))
+        super().__init__(modules)
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            logging.info("Use pytorch device: {}".format(device))
 
-            transformer_config = PretrainedConfig.from_json_file(output_transformer_config_file)
-            model_class = self.import_from_string(sentence_transformer_config.model)
-            self.transformer_model = model_class(transformer_config, sentence_transformer_config=sentence_transformer_config)
-            self.transformer_model.load_state_dict(torch.load(output_model_file, map_location='cuda' if torch.cuda.is_available() else 'cpu'))
-            
-        elif sentence_transformer_config is not None:
-            logging.info("Creating a new {} model with config {}".format(sentence_transformer_config.model, sentence_transformer_config))
-            model_class = self.import_from_string(sentence_transformer_config.model)
-            self.transformer_model = model_class.from_pretrained(sentence_transformer_config.tokenizer_model)
-            self.transformer_model.set_config(sentence_transformer_config)
-            
-        else:
-            raise ValueError("model_url, model_path and config can not be all None.")
+        self.device = torch.device(device)
+        self.to(device)
 
-        self.transformer_model.set_tokenizer(sentence_transformer_config.tokenizer_model, sentence_transformer_config.do_lower_case)
-        self.encoder = SentenceEncoder(self.transformer_model, sentence_transformer_config)
-        self.trainer = SentenceTrainer(self.transformer_model)
-
-    def import_from_string(self, dotted_path):
+    def encode(self, sentences: List[str], batch_size: int = 8, show_progress_bar: bool = None, output_value: str = 'sentence_embedding', convert_to_numpy: bool = True) -> List[ndarray]:
         """
-        Import a dotted module path and return the attribute/class designated by the
-        last name in the path. Raise ImportError if the import failed.
+        Computes sentence embeddings
+
+        :param sentences:
+           the sentences to embed
+        :param batch_size:
+           the batch size used for the computation
+        :param show_progress_bar:
+            Output a progress bar when encode sentences
+        :param output_value:
+            Default sentence_embedding, to get sentence embeddings. Can be set to token_embeddings
+            to get wordpiece token embeddings.
+        :param convert_to_numpy:
+            If true, the output is a list of numpy vectors. Else, it is a list of pytorch tensors.
+        :return:
+           Depending on convert_to_numpy, either a list of numpy vectors or a list of pytorch tensors
         """
-        try:
-            module_path, class_name = dotted_path.rsplit('.', 1)
-        except ValueError:
-            msg = "%s doesn't look like a module path" % dotted_path
-            raise ImportError(msg)
-
-        module = importlib.import_module(module_path)
-
-        try:
-            return getattr(module, class_name)
-        except AttributeError:
-            msg = 'Module "%s" does not define a "%s" attribute/class' % (module_path, class_name)
-            raise ImportError(msg)
-
-    def encode(self, sentences: List[str], batch_size: int = 32, show_progress_bar: bool = None) -> List[ndarray]:
-        """
-        Get the Sentence BERT embedding for a list of sentences
-
-        :param sentences
-            list of sentences to embed
-        :param batch_size
-            the batch size used for the encoding
-        :return: a list of ndarrays with the embedding for each sentence
-        """
+        self.eval()
         if show_progress_bar is None:
-            show_progress_bar = (logging.getLogger().getEffectiveLevel() == logging.INFO or logging.getLogger().getEffectiveLevel() == logging.DEBUG)
+            show_progress_bar = (logging.getLogger().getEffectiveLevel()==logging.INFO or logging.getLogger().getEffectiveLevel()==logging.DEBUG)
 
-        return self.encoder.get_sentence_embeddings(sentences, batch_size, show_progress_bar)
+        all_embeddings = []
+        length_sorted_idx = np.argsort([len(sen) for sen in sentences])
 
-    def train(self, dataloader: DataLoader, train_config: TrainConfig):
+        iterator = range(0, len(sentences), batch_size)
+        if show_progress_bar:
+            iterator = tqdm(iterator, desc="Batches")
+
+        for batch_idx in iterator:
+            batch_tokens = []
+
+            batch_start = batch_idx
+            batch_end = min(batch_start + batch_size, len(sentences))
+
+            longest_seq = 0
+
+            for idx in length_sorted_idx[batch_start: batch_end]:
+                sentence = sentences[idx]
+                tokens = self.tokenize(sentence)
+                longest_seq = max(longest_seq, len(tokens))
+                batch_tokens.append(tokens)
+
+            features = {}
+            for text in batch_tokens:
+                sentence_features = self.get_sentence_features(text, longest_seq)
+
+                for feature_name in sentence_features:
+                    if feature_name not in features:
+                        features[feature_name] = []
+                    features[feature_name].append(sentence_features[feature_name])
+
+            for feature_name in features:
+                #features[feature_name] = torch.tensor(np.asarray(features[feature_name])).to(self.device)
+                features[feature_name] = torch.cat(features[feature_name]).to(self.device)
+
+            with torch.no_grad():
+                out_features = self.forward(features)
+                embeddings = out_features[output_value]
+
+                if output_value == 'token_embeddings':
+                    #Set token embeddings to 0 for padding tokens
+                    input_mask = out_features['attention_mask']
+                    input_mask_expanded = input_mask.unsqueeze(-1).expand(embeddings.size()).float()
+                    embeddings = embeddings * input_mask_expanded
+
+                if convert_to_numpy:
+                    embeddings = embeddings.to('cpu').numpy()
+
+                all_embeddings.extend(embeddings)
+
+        reverting_order = np.argsort(length_sorted_idx)
+        all_embeddings = [all_embeddings[idx] for idx in reverting_order]
+
+        return all_embeddings
+
+    def get_max_seq_length(self):
+        if hasattr(self._first_module(), 'max_seq_length'):
+            return self._first_module().max_seq_length
+
+        return None
+
+    def tokenize(self, text):
+        return self._first_module().tokenize(text)
+
+    def get_sentence_features(self, *features):
+        return self._first_module().get_sentence_features(*features)
+
+    def get_sentence_embedding_dimension(self):
+        return self._last_module().get_sentence_embedding_dimension()
+
+    def _first_module(self):
+        """Returns the first module of this sequential embedder"""
+        return self._modules[next(iter(self._modules))]
+
+    def _last_module(self):
+        """Returns the last module of this sequential embedder"""
+        return self._modules[next(reversed(self._modules))]
+
+    def save(self, path):
         """
-        Train the Sentence BERT model on the given data
-
-        :param dataloader
-            the data for the training as a DataLoader
-        :param train_config
-            the training configuration
+        Saves all elements for this seq. sentence embedder into different sub-folders
         """
-        self.trainer.train(dataloader, train_config)
+        if path is None:
+            return
 
-    def multitask_train(self, dataloaders: List[DataLoader], losses: List[LossFunction], train_config: TrainConfig):
+        logging.info("Save model to {}".format(path))
+        contained_modules = []
+
+        for idx, name in enumerate(self._modules):
+            module = self._modules[name]
+            model_path = os.path.join(path, str(idx)+"_"+type(module).__name__)
+            os.makedirs(model_path, exist_ok=True)
+            module.save(model_path)
+            contained_modules.append({'idx': idx, 'name': name, 'path': os.path.basename(model_path), 'type': type(module).__module__})
+
+        with open(os.path.join(path, 'modules.json'), 'w') as fOut:
+            json.dump(contained_modules, fOut, indent=2)
+
+        with open(os.path.join(path, 'config.json'), 'w') as fOut:
+            json.dump({'__version__': __version__}, fOut, indent=2)
+
+    def smart_batching_collate(self, batch):
         """
-        Train the model with the given data and config with the given loss for each dataset
+        Transforms a batch from a SmartBatchingDataset to a batch of tensors for the model
 
-        Each dataloader is sampled in turn for one batch.
-        We sample only as many batches from each dataloader as there are in the smallest one
+        :param batch:
+            a batch from a SmartBatchingDataset
+        :return:
+            a batch of tensors for the model
+        """
+        num_texts = len(batch[0][0])
+
+        labels = []
+        paired_texts = [[] for _ in range(num_texts)]
+        max_seq_len = [0] * num_texts
+        for tokens, label in batch:
+            labels.append(label)
+            for i in range(num_texts):
+                paired_texts[i].append(tokens[i])
+                max_seq_len[i] = max(max_seq_len[i], len(tokens[i]))
+
+        features = []
+        for idx in range(num_texts):
+            max_len = max_seq_len[idx]
+            feature_lists = {}
+
+            for text in paired_texts[idx]:
+                sentence_features = self.get_sentence_features(text, max_len)
+
+                for feature_name in sentence_features:
+                    if feature_name not in feature_lists:
+                        feature_lists[feature_name] = []
+
+                    feature_lists[feature_name].append(sentence_features[feature_name])
+
+
+            for feature_name in feature_lists:
+                #feature_lists[feature_name] = torch.tensor(np.asarray(feature_lists[feature_name]))
+                feature_lists[feature_name] = torch.cat(feature_lists[feature_name])
+
+            features.append(feature_lists)
+
+        return {'features': features, 'labels': torch.stack(labels)}
+
+
+
+    def fit(self,
+            train_objectives: Iterable[Tuple[DataLoader, nn.Module]],
+            evaluator: SentenceEvaluator,
+            epochs: int = 1,
+            steps_per_epoch = None,
+            scheduler: str = 'WarmupLinear',
+            warmup_steps: int = 10000,
+            optimizer_class: Type[Optimizer] = transformers.AdamW,
+            optimizer_params : Dict[str, object ]= {'lr': 2e-5, 'eps': 1e-6, 'correct_bias': False},
+            weight_decay: float = 0.01,
+            evaluation_steps: int = 0,
+            output_path: str = None,
+            save_best_model: bool = True,
+            max_grad_norm: float = 1,
+            fp16: bool = False,
+            fp16_opt_level: str = 'O1',
+            local_rank: int = -1
+            ):
+        """
+        Train the model with the given training objective
+
+        Each training objective is sampled in turn for one batch.
+        We sample only as many batches from each objective as there are in the smallest one
         to make sure of equal training with each dataset.
 
-        :param dataloaders:
-            the data for the training
-        :param losses:
-            the losses for each dataloader
-            the losses still uses the configuration as given in sentence_transformer_config, so you cannot for example
-            have two different LossFunction.SOFTMAX with different number of labels
-        :param train_config:
-            the configuration for the training
+        :param weight_decay:
+        :param scheduler:
+        :param warmup_steps:
+        :param optimizer:
+        :param evaluation_steps:
+        :param output_path:
+        :param save_best_model:
+        :param max_grad_norm:
+        :param fp16:
+        :param fp16_opt_level:
+        :param local_rank:
+        :param train_objectives:
+            Tuples of DataLoader and LossConfig
+        :param evaluator:
+        :param epochs:
+        :param steps_per_epoch: Train for x steps in each epoch. If set to None, the length of the dataset will be used
         """
-        self.trainer.multitask_train(dataloaders, losses, train_config)
+        if output_path is not None:
+            os.makedirs(output_path, exist_ok=True)
+            if os.listdir(output_path):
+                raise ValueError("Output directory ({}) already exists and is not empty.".format(
+                    output_path))
+
+        dataloaders = [dataloader for dataloader, _ in train_objectives]
+
+        # Use smart batching
+        for dataloader in dataloaders:
+            dataloader.collate_fn = self.smart_batching_collate
+
+        loss_models = [loss for _, loss in train_objectives]
+        device = self.device
+
+        for loss_model in loss_models:
+            loss_model.to(device)
+
+        self.best_score = -9999999
+
+        if steps_per_epoch is None or steps_per_epoch == 0:
+            steps_per_epoch = min([len(dataloader) for dataloader in dataloaders])
+
+        num_train_steps = int(steps_per_epoch * epochs)
+
+        # Prepare optimizers
+        optimizers = []
+        schedulers = []
+        for loss_model in loss_models:
+            param_optimizer = list(loss_model.named_parameters())
+
+            no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+            optimizer_grouped_parameters = [
+                {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': weight_decay},
+                {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+            ]
+            t_total = num_train_steps
+            if local_rank != -1:
+                t_total = t_total // torch.distributed.get_world_size()
+
+            optimizer = optimizer_class(optimizer_grouped_parameters, **optimizer_params)
+            scheduler_obj = self._get_scheduler(optimizer, scheduler=scheduler, warmup_steps=warmup_steps, t_total=t_total)
+
+            optimizers.append(optimizer)
+            schedulers.append(scheduler_obj)
+
+        if fp16:
+            try:
+                from apex import amp
+            except ImportError:
+                raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+
+            for train_idx in range(len(loss_models)):
+                model, optimizer = amp.initialize(loss_models[train_idx], optimizers[train_idx], opt_level=fp16_opt_level)
+                loss_models[train_idx] = model
+                optimizers[train_idx] = optimizer
+
+        global_step = 0
+        data_iterators = [iter(dataloader) for dataloader in dataloaders]
+
+        num_train_objectives = len(train_objectives)
+
+        for epoch in trange(epochs, desc="Epoch"):
+            training_steps = 0
+
+            for loss_model in loss_models:
+                loss_model.zero_grad()
+                loss_model.train()
+
+            for _ in trange(steps_per_epoch, desc="Iteration", smoothing=0.05):
+                for train_idx in range(num_train_objectives):
+                    loss_model = loss_models[train_idx]
+                    optimizer = optimizers[train_idx]
+                    scheduler = schedulers[train_idx]
+                    data_iterator = data_iterators[train_idx]
+
+                    try:
+                        data = next(data_iterator)
+                    except StopIteration:
+                        #logging.info("Restart data_iterator")
+                        data_iterator = iter(dataloaders[train_idx])
+                        data_iterators[train_idx] = data_iterator
+                        data = next(data_iterator)
+
+                    features, labels = batch_to_device(data, self.device)
+                    loss_value = loss_model(features, labels)
+
+                    if fp16:
+                        with amp.scale_loss(loss_value, optimizer) as scaled_loss:
+                            scaled_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), max_grad_norm)
+                    else:
+                        loss_value.backward()
+                        torch.nn.utils.clip_grad_norm_(loss_model.parameters(), max_grad_norm)
+
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+
+                training_steps += 1
+                global_step += 1
+
+                if evaluation_steps > 0 and training_steps % evaluation_steps == 0:
+                    self._eval_during_training(evaluator, output_path, save_best_model, epoch, training_steps)
+                    for loss_model in loss_models:
+                        loss_model.zero_grad()
+                        loss_model.train()
+
+            self._eval_during_training(evaluator, output_path, save_best_model, epoch, -1)
 
     def evaluate(self, evaluator: SentenceEvaluator, output_path: str = None):
-        """"
+        """
         Evaluate the model
 
         :param evaluator:
             the evaluator
         :param output_path:
             the evaluator can write the results to this path
-            The directories will be created, if they do not exist.
-            Files in the folder might be overwritten or appended
         """
-        self.trainer.evaluate(evaluator, output_path)
+        if output_path is not None:
+            os.makedirs(output_path, exist_ok=True)
+        return evaluator(self, output_path)
 
-    def save(self, path: str):
-        """
-        Save the Sentence BERT model at the given path
+    def _eval_during_training(self, evaluator, output_path, save_best_model, epoch, steps):
+        """Runs evaluation during the training"""
+        if evaluator is not None:
+            score = evaluator(self, output_path=output_path, epoch=epoch, steps=steps)
+            if score > self.best_score and save_best_model:
+                self.save(output_path)
+                self.best_score = score
 
-        Directories are created if they do not exist yet.
-        The model can be reloaded with SentenceTransformer(model_path=path).
 
-        :param path:
-            path where the model will be saved
-            The directories will be created, if they do not exist.
-            Previous models at the path will be overwritten
+    def _get_scheduler(self, optimizer, scheduler: str, warmup_steps: int, t_total: int):
         """
-        self.trainer.save(path)
-
-    def smart_batching_collate(self) -> Callable[[List[Tuple[List[List[str]], Tensor]]],
-                                                 Tuple[List[Tensor], List[Tensor], List[Tensor], Tensor]]:
+        Returns the correct learning rate scheduler
         """
-        Collate function to transform a batch from a SmartBatchingDataset to a batch of tensors for the model
-        """
-        return self.encoder.smart_batching_collate
+        scheduler = scheduler.lower()
+        if scheduler == 'constantlr':
+            return transformers.get_constant_schedule(optimizer)
+        elif scheduler == 'warmupconstant':
+            return transformers.get_constant_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps)
+        elif scheduler == 'warmuplinear':
+            return transformers.get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=t_total)
+        elif scheduler == 'warmupcosine':
+            return transformers.get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=t_total)
+        elif scheduler == 'warmupcosinewithhardrestarts':
+            return transformers.get_cosine_with_hard_restarts_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=t_total)
+        else:
+            raise ValueError("Unknown scheduler {}".format(scheduler))

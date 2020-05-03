@@ -1,152 +1,83 @@
-import torch
 from torch import Tensor
-from pytorch_transformers import XLNetConfig, XLNetModel, XLNetTokenizer
-from pytorch_transformers.modeling_xlnet import XLNetPreTrainedModel
-
-
-from typing import Union, Tuple, List
-from .. import LossFunction
-from .. import SentenceTransformerConfig
-from .TransformerModel import TransformerModel
-
-
 from torch import nn
-from torch.nn import functional as F
-from torch.nn import CrossEntropyLoss, MSELoss
+from transformers import XLNetModel, XLNetTokenizer
+import json
+from typing import Union, Tuple, List, Dict, Optional
+import os
+import numpy as np
 
-class XLNet(XLNetPreTrainedModel, TransformerModel):
-    def __init__(self, config: XLNetConfig, sentence_transformer_config: SentenceTransformerConfig = None):
-        XLNetPreTrainedModel.__init__(self, config)
+class XLNet(nn.Module):
+    """XLNet model to generate token embeddings.
 
-        self.model_config = config
-        self.model_hidden_size = config.d_model
+    Each token is mapped to an output vector from XLNet.
+    """
+    def __init__(self, model_name_or_path: str, max_seq_length: int = 128, do_lower_case: Optional[bool] = None, model_args: Dict = {}, tokenizer_args: Dict = {}):
+        super(XLNet, self).__init__()
+        self.config_keys = ['max_seq_length', 'do_lower_case']
+        self.max_seq_length = max_seq_length
+        self.do_lower_case = do_lower_case
 
-        TransformerModel.__init__(self, sentence_transformer_config)
+        if self.do_lower_case is not None:
+            tokenizer_args['do_lower_case'] = do_lower_case
 
-        self.transformer = XLNetModel(config)
-        self.apply(self.init_weights)
+        self.xlnet = XLNetModel.from_pretrained(model_name_or_path, **model_args)
+        self.tokenizer = XLNetTokenizer.from_pretrained(model_name_or_path, **tokenizer_args)
+        self.cls_token_id = self.tokenizer.convert_tokens_to_ids([self.tokenizer.cls_token])[0]
+        self.sep_token_id = self.tokenizer.convert_tokens_to_ids([self.tokenizer.sep_token])[0]
 
-        ##Code from summary
-        self.summary = nn.Identity()
-        if hasattr(config, 'summary_use_proj') and config.summary_use_proj:
-            self.summary = nn.Linear(config.d_model, config.d_model)
+    def forward(self, features):
+        """Returns token_embeddings, cls_token"""
+        output_states = self.xlnet(**features)
+        output_tokens = output_states[0]
+        cls_tokens = output_tokens[:, -1, :]  # CLS token is the last token
+        features.update({'token_embeddings': output_tokens, 'cls_token_embeddings': cls_tokens, 'attention_mask': features['attention_mask']})
 
-        self.activation = nn.Identity()
-        if hasattr(config, 'summary_activation') and config.summary_activation=='tanh':
-            self.activation = nn.Tanh()
+        if self.xlnet.config.output_hidden_states:
+            hidden_states = output_states[2]
+            features.update({'all_layer_embeddings': hidden_states})
 
-        self.first_dropout = nn.Identity()
-        if hasattr(config, 'summary_first_dropout') and config.summary_first_dropout > 0:
-            self.first_dropout = nn.Dropout(config.summary_first_dropout)
+        return features
 
-        self.last_dropout = nn.Identity()
-        if hasattr(config, 'summary_last_dropout') and config.summary_last_dropout > 0:
-            self.last_dropout = nn.Dropout(config.summary_last_dropout)
+    def get_word_embedding_dimension(self) -> int:
+        return self.xlnet.config.d_model
 
-
-    def set_tokenizer(self, tokenizer_model: str, do_lower_case: bool):
+    def tokenize(self, text: str) -> List[int]:
         """
-        Sets the tokenizer for this model
+        Tokenizes a text and maps tokens to token-ids
         """
-        self.tokenizer_model = XLNetTokenizer.from_pretrained(tokenizer_model, do_lower_case=do_lower_case)
+        return self.tokenizer.convert_tokens_to_ids(self.tokenizer.tokenize(text))
 
-
-    def forward(self, input_ids: List[Tensor], token_type_ids: List[Tensor], attention_mask: List[Tensor],
-                labels: Tensor = None, alternative_loss: LossFunction = None) -> Union[
-        Tensor, Tuple[List[Tensor], Tensor]]:
-        """
-        Forward pass of the model for a variable number of sentences, each represented as input ids,
-        segment ids and masks.
-
-        If labels are given, then the training loss is returned otherwise sentence embeddings
-        and the LossFunction value is returned.
-        The training loss is not the same as the LossFunction value.
-
-        :param input_ids:
-            list of Tensors of the token embedding ids
-        :param token_type_ids:
-            list of Tensors of the segment ids
-        :param attention_mask:
-            list of Tensors of the masks
-        :param labels:
-            Tensor of the training labels
-        :param alternative_loss:
-            an alternative loss different to self.sentence_transformer_config.loss_function for multitask learning.
-            the loss still uses the configuration as given in self.sbert_config, so you cannot for example
-            have two different LossFunction.SOFTMAX with different number of labels
-        :return: the training loss or the two sentence embeddings and the LossFunction value (if available for the
-            chosen loss)
-        """
-        reps = [self.get_sentence_representation(ids, seg, mask) for ids, seg, mask
-                in zip(input_ids, token_type_ids, attention_mask)]
-
-        return self.compute_loss(reps, labels, alternative_loss)
-
-
-    def _get_transformer_output(self, input_ids: Tensor, token_type_ids: Tensor, attention_mask: Tensor):
-        """
-        Internal method that invokes the underlying model
-        and returns the output vectors for all input tokens
-        """
-        transformer_outputs = self.transformer(input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask)
-
-        output_tokens = transformer_outputs[0]
-        cls_tokens = output_tokens[:, -1] # CLS token is the last token
-
-        #cls_tokens = self.first_dropout(cls_tokens)
-        cls_tokens = self.summary(cls_tokens)
-        cls_tokens = self.activation(cls_tokens)
-        #cls_tokens = self.last_dropout(cls_tokens)
-
-        return output_tokens, cls_tokens
-
-    def get_sentence_features(self, tokens: List[str], max_seq_length: int) -> Tuple[List[int], List[int], List[int]]:
+    def get_sentence_features(self, tokens: List[int], pad_seq_length: int) -> Dict[str, Tensor]:
         """
         Convert tokenized sentence in its embedding ids, segment ids and mask
 
         :param tokens:
             a tokenized sentence
-        :param max_seq_length:
-            the maximal length of the sequence.
-            If this is greater than self.max_seq_length, then self.max_seq_length is used.
-            If this is 0, then self.max_seq_length is used.
+        :param pad_seq_length:
+            the maximal length of the sequence. Cannot be greater than self.sentence_transformer_config.max_seq_length
         :return: embedding ids, segment ids and mask for the sentence
         """
-        sep_token = self.tokenizer_model.sep_token
-        cls_token = self.tokenizer_model.cls_token
-        sequence_a_segment_id = 0
-        cls_token_segment_id = 2
-        pad_token_segment_id = 4
-        pad_token = 0
+        pad_seq_length = min(pad_seq_length, self.max_seq_length) + 3 #Add space for special tokens
+        return self.tokenizer.prepare_for_model(tokens, max_length=pad_seq_length, pad_to_max_length=True, return_tensors='pt')
 
+    def get_config_dict(self):
+        return {key: self.__dict__[key] for key in self.config_keys}
 
-        max_seq_length += 2 ##Add space for CLS + SEP token
+    def save(self, output_path: str):
+        self.xlnet.save_pretrained(output_path)
+        self.tokenizer.save_pretrained(output_path)
 
-        tokens = tokens[:(max_seq_length - 2)] + [sep_token]
-        segment_ids = [sequence_a_segment_id] * len(tokens)
+        with open(os.path.join(output_path, 'sentence_xlnet_config.json'), 'w') as fOut:
+            json.dump(self.get_config_dict(), fOut, indent=2)
 
-        # XLNet CLS token at at
-        tokens = tokens + [cls_token]
-        segment_ids = segment_ids + [cls_token_segment_id]
-
-        input_ids = self.tokenizer_model.convert_tokens_to_ids(tokens)
-
-        input_mask = [1] * len(input_ids)
-
-        # Zero-pad up to the sequence length. XLNet: Pad to the left
-        padding_length = max_seq_length - len(input_ids)
-        input_ids = ([pad_token] * padding_length) + input_ids
-        input_mask = ([0] * padding_length) + input_mask
-        segment_ids = ([pad_token_segment_id] * padding_length) + segment_ids
-
-        assert len(input_ids)==max_seq_length
-        assert len(input_mask)==max_seq_length
-        assert len(segment_ids)==max_seq_length
+    @staticmethod
+    def load(input_path: str):
+        with open(os.path.join(input_path, 'sentence_xlnet_config.json')) as fIn:
+            config = json.load(fIn)
+        return XLNet(model_name_or_path=input_path, **config)
 
 
 
-
-        return input_ids, segment_ids, input_mask
 
 
 
