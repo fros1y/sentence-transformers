@@ -13,7 +13,7 @@ from numpy import ndarray
 from torch import nn, Tensor
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
-from tqdm import tqdm, trange
+from tqdm.autonotebook import tqdm, trange
 
 from . import __DOWNLOAD_SERVER__
 from .evaluation import SentenceEvaluator
@@ -48,7 +48,7 @@ class SentenceTransformer(nn.Sequential):
                 os.makedirs(model_path, exist_ok=True)
 
                 if not os.listdir(model_path):
-                    if model_url[-1] is "/":
+                    if model_url[-1] == "/":
                         model_url = model_url[:-1]
                     logging.info("Downloading sentence transformer model from {} and saving it at {}".format(model_url, model_path))
                     try:
